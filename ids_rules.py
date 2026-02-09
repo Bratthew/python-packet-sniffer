@@ -35,12 +35,12 @@ IDS_SIGNATURES = [
 		"name": "PHP Webshell",
 		"pattern": b"<?php system(",
 		"desc": "Attempt to execute system commands via PHP"
-	},
-	{
-		"name": "Nmap Scan (XMAS)",
-		"pattern": b"\x00\x00\x00\x00\x00\x00",
-		"desc": "Potential Reconnaissance Scan"
 	}
+#	{
+#		"name": "Nmap Scan (XMAS)",
+#		"pattern": b"\x00\x00\x00\x00\x00\x00",
+#		"desc": "Potential Reconnaissance Scan"
+#	}
 ]
 
 def check_signatures(payload):
