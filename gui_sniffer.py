@@ -12,18 +12,49 @@ import matplotlib.pyplot as plt
 import ids_rules
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
+import queue
+import sys
+import json
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
+if os.geteuid() != 0:
+	messagebox.showerror("Error", "This application must be run as ROOT(sudo)")
+	sys.exit(1)
 
 ip_geo_cache = {}
 stop_sniffing = False
 is_recording = False
 pcap_filename = "capture.pcap"
+gui_queue = queue.Queue()
+arp_table = {}
+scan_tracker = {}
 
 PCAP_GLOBAL_HEADER_FMT = '@ I H H i I I I'
 PCAP_PACKET_HEADER_FMT = '@ I I I I'
 LINKTYPE_ETHERNET = 1
+
+def update_gui_loop():
+	try:
+		while True:
+			msg_type, content = gui_queue.get_nowait()
+
+			if msg_type == "log":
+				log_box.insert("end", content)
+
+				num_lines = int(log_box.index('end-1c').split('.')[0])
+				if num_lines > 1000:
+					log_box.delete("0.0", "1.0")
+
+				log_box.see("end")
+
+			elif msg_type == "alert":
+				alert_box.insert("end", content)
+				alert_box.see("end")
+
+	except queue.Empty:
+		pass
+	app.after(100, update_gui_loop)
 
 def block_ip(ip_address):
 	if ip_address == "127.0.0.1" or ip_address.startswith("10.0.2"):
@@ -40,12 +71,13 @@ def start_honeyport(port, log_widget):
 		server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 		server.bind(("0.0.0.0", port))
 		server.listen(5)
-		log_widget.insert("end", f"[*] HONEYPOT TRAP Active on Port {port}..\n")
+		gui_queue.put(("log", f"[*] HONEYPOT TRAP Active on Port {port}..\n"))
 		while True:
 			client, addr = server.accept()
 			attacker_ip = addr[0]
 			alert_msg = f"[!!!] HONEYPOT TRIGGERED by {attacker_ip}!\n"
-			log_widget.insert("end", alert_msg)
+			gui_queue.put(("alert", alert_msg))
+			gui_queue.put(("log", alert_msg))
 			data = "No Data"
 			try:
 				client.send(b"SSH-2.0-OpenSSH_Legacy_v4.3\nPassword: ")
@@ -179,6 +211,23 @@ def log_alert_to_db(timestamp, src_ip, attack_name, description):
 		c.execute("INSERT INTO alerts (timestamp, src_ip, attack_name, description) VALUES (?, ?, ?, ?)", (timestamp, src_ip, attack_name, description))
 		conn.commit()
 		conn.close()
+
+	except:
+		pass
+
+	alert_data = {
+		"timestamp": timestamp,
+		"src_ip": src_ip,
+		"alert": attack_name,
+		"details": description
+	}
+	log_json_alert(alert_data)
+
+def log_json_alert(alert_dict):
+	try:
+		with open("alerts.json", "a") as f:
+			json.dump(alert_dict, f)
+			f.write("\n")
 	except:
 		pass
 
@@ -310,47 +359,61 @@ def start_sniffer_thread():
 	stop_sniffing = False
 	last_log_entry = ""
 	packet_counts = {}
+	packet_counter = 0
 	last_time_check = time.time()
 	THRESHOLD_PPS = 50
 
 	try:
 		conn = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3))
 	except PermissionError:
-		messagebox.showerror("Error", "Must be ran as ROOT (sudo)")
+		gui_queue.put(("log", "[-] Error: Run as Sudo!\n"))
 		return
 
-	log_box.insert("end", "[*] Sniffer running\n")
+	gui_queue.put(("log", "[*] Sniffer running...\n"))
+	
 	while not stop_sniffing:
+		packet_counter += 1
+		if gui_queue.qsize() > 500:
+			try:
+				conn.recvfrom(65535)
+			except: pass
+			continue
 		try:
-			conn.settimeout(1)
 			raw_data, addr = conn.recvfrom(65535)
 			dest_mac, src_mac, eth_proto, data = ethernet_frame(raw_data)
 
 			if eth_proto == 8:
 				(version, header_length, ttl, proto, src, target, data) = ipv4_packet(data)
-				packet_counts[src] = packet_counts.get(src, 0) + 1
 
+				if src in arp_table:
+					if arp_table[src] != src_mac:
+						alert_msg = f"[!!!] ARP SPOOF: {src} is at {src_mac} (was {arp_table[src]})\n"
+						gui_queue.put(("alert", alert_msg))
+						log_alert_to_db(time.strftime("%H:%M:%S"), src, "ARP Spoofing", f"MAC Change: {src_mac}")
+				else:
+					arp_table[src] = src_mac
+
+				packet_counts[src] = packet_counts.get(src, 0) + 1
 				if time.time() - last_time_check > 2:
 					for ip, count in packet_counts.items():
 						if count > THRESHOLD_PPS:
 							attack_name = "Potential DoS / Flood"
-							attack_desc = f"High Traffic Volume: {count} packets in 2s"
-							alert_msg = f"[!!!] ANOMALY [{timestamp}]: {attack_name} from {ip}\n"
-							alert_box.insert("end", alert_msg)
-							alert_box.see("end")
-							log_alert_to_db(timestamp, ip, attack_name, attack_desc)
+							attack_desc = f"High Traffic: {count} pkts/2s"
+							alert_msg = f"[!!!] ANOMALY: {attack_name} from {ip}\n"
+							gui_queue.put(("alert", alert_msg))
+							log_alert_to_db(time.strftime("%H:%M:%S"), ip, attack_name, attack_desc)
 
 							if chk_block_var.get():
 								if block_ip(ip):
-									alert_box.insert("end", f"[ACTION]: FIREWALL BLOCKED {ip}!\n")
+									gui_queue.put(("alert", f"[ACTION]: BLOCKED {ip}!\n"))
+					packet_counts = {}
+					last_time_check = time.time()
 
-						packet_counts = {}
-						last_time_check = time.time()
 
 				filter_txt = entry_filter.get().strip()
-
 				if filter_txt and (filter_txt not in src and filter_txt not in target):
 					continue
+
 				timestamp = time.strftime("%H:%M:%S")
 				src_os = detect_os(ttl)
 				log_msg = f"[{timestamp}] {src} ({src_os}) -> {target}"
@@ -358,71 +421,76 @@ def start_sniffer_thread():
 				if proto == 6:
 					src_port, dest_port, seq, ack, urg, ack_flag, psh, rst, syn, fin, payload = tcp_segment(data)
 
-					if len(payload) > 0:
-						attack_name, attack_desc = ids_rules.check_signatures(payload)
+					current_time = time.time()
+					if src not in scan_tracker:
+						scan_tracker[src] = {'ports': {dest_port}, 'start_time': current_time}
+					else:
+						if current_time - scan_tracker[src]['start_time'] > 5:
+							scan_tracker[src] = {'ports': {dest_port}, 'start_time': current_time}
+						else:
+							scan_tracker[src]['ports'].add(dest_port)
 
-						if attack_name:
-							alert_msg = f"[!!!] ALERT [{timestamp}]: {attack_name} from {src}\n"
-							alert_box.insert("end", alert_msg)
-							alert_box.see("end")
-							log_alert_to_db(timestamp, src, attack_name, attack_desc)
+					if len(scan_tracker[src]['ports']) > 15:
+						if len(scan_tracker[src]['ports']) == 16:
+							alert_msg = f"[!!!] PORT SCAN: {src} hit {len(scan_tracker[src]['ports'])} ports\n"
+							gui_queue.put(("alert", alert_msg))
+							log_alert_to_db(timestamp, src, "Port Scan", "Heuristic Detection (Nmap?)")
 
 							if chk_block_var.get():
 								if block_ip(src):
-									alert_box.insert("end", f" [ACTION]: FIREWALL BLOCKED {src}!\n")
-									log_msg += " [BLOCKED]"
-								log_msg += f" | [THREAT: {attack_name}]"
-							sni = get_tls_sni(payload)
+									gui_queue.put(("alert", f"[ACTION]: BLOCKED {src}!\n"))
 
-							if sni:
-								log_msg += f" | [HTTPS] Handshake: {sni}"
-							elif len(payload) > 0:
-								try:
-									decoded = payload.decode('utf-8')
-									if "GET" in decoded or "POST" in decoded or "HTTP" in decoded:
-										first_line = decoded.split('\n')[0]
-										log_msg == f" | [HTTP] {first_line}"
-								except:
-									pass
-							if not src.startswith("10.") and not src.startswith("192."):
-								loc = get_geolocation(src)
-								if loc != "Unknown": log_msg += f" [Src: {loc}]"
-							elif not target.startswith("10.") and not target.startswith("192."):
-								loc = get_geolocation(target)
-								if loc != "Unknown": log_msg += f" [Dst: {loc}]"
-						elif proto == 17:
-							src_port, dest_port, size, payload = udp_segment(data)
-							log_msg += f" | Protocol: UDP ({src_port} -> {dest_port})"
+					if len(payload) > 0:
+						attack_name, attack_desc = ids_rules.check_signatures(payload)
+						if attack_name:
+							alert_msg = f"[!!!] ALERT [{timestamp}]: {attack_name} from {src}\n"
+							gui_queue.put(("alert", alert_msg))
+							log_alert_to_db(timestamp, src, attack_name, attack_desc)
 
-							if len(payload) > 0:
-								attack_name, attack_desc = ids_rules.check_signatures(payload)
-								if attack_name:
-									alert_msg = f"[!!!] ALERT [{timestamp}]: {attack_name} from {src}\n"
-									alert_box.insert("end", alert_msg)
-									log_alert_to_db(timestamp, src, attack_name, attack_desc)
+							if chk_block_var.get():
+								block_ip(src)
+								log_msg += " [BLOCKED]"
 
-									if chk_block_var.get(): block_ip(src)
-									log_msg += f" | [THREAT: {attack_name}]"
-							if src_port == 53 or dest_port == 53:
-								log_msg += " | [DNS] Query/Response"
-						elif proto == 1:
-							icmp_type, code, checksum, payload = icmp_packet(data)
-							if icmp_type == 8: log_msg += " | [ICMP] Ping Requests"
-							elif icmp_type == 0: log_msg += " | [ICMP] Ping Reply"
-							else: log_msg += f" | [ICMP] Type {icmp_type}"
-						if log_msg != last_log_entry or "THREAT" in log_msg:
-							log_box.insert("end", log_msg + "\n")
-							log_box.see("end")
-							last_log_entry = log_msg
-							if is_recording: append_to_pcap(pcap_filename, raw_data)
+							log_msg += f" | [THREAT: {attack_name}]"
+
+						sni = get_tls_sni(payload)
+						if sni:
+							log_msg += f" | [HTTPS] {sni}"
+						elif len(payload) > 0:
+							try:
+
+								decoded = payload.decode('utf-8', errors='ignore')
+								if any(m in decoded[:10] for m in ["GET", "POST", "HTTP"]):
+									log_msg += f" | [HTTP] {decoded.splitlines()[0][:50]}"
+							except: pass
+				elif proto == 17:
+					src_port, dest_port, size, payload = udp_segment(data)
+					log_msg += f" | UDP ({src_port}->{dest_port})"
+					if len(payload) > 0:
+						attack_name, attack_desc = ids_rules.check_signatures(payload)
+						if attack_name:
+							gui_queue.put(("alert", f"[!!!] {attack_name} from {src}\n"))
+							log_alert_to_db(timestamp, src, attack_name, attack_desc)
+							if chk_block_var.get(): block_ip(src)
+
+				elif proto == 1:
+					icmp_type, code, checksum, payload = icmp_packet(data)
+					if icmp_type == 8: log_msg += " | [Ping Req]"
+					elif icmp_type == 0: log_msg += " | [Ping Rep]"
+
+				if log_msg != last_log_entry or "THREAT" in log_msg:
+					gui_queue.put(("log", log_msg + "\n"))
+					last_log_entry = log_msg
+					if is_recording: append_to_pcap(pcap_filename, raw_data)
+
 		except socket.timeout:
 			continue
 		except Exception as e:
-			print(f"Error: {e}")
+			# gui_queue.put(("log", f"Error: {e}\n"))
 			continue
 
 	conn.close()
-	log_box.insert("end", "[*] Sniffer stopped\n")
+	gui_queue.put(("log", "[*] Sniffer stopped\n"))
 
 def on_start():
 	t = threading.Thread(target=start_sniffer_thread)
@@ -489,4 +557,5 @@ alert_box = ctk.CTkTextbox(main_frame, width=600, height=100, font=("Consolas", 
 alert_box.pack(fill="x", padx=10, pady=(0, 10))
 
 init_db()
+app.after(100, update_gui_loop)
 app.mainloop()

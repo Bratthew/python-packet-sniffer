@@ -1,55 +1,66 @@
+import re
+
 IDS_SIGNATURES = [
 	{
+		"name": "Scanner Tool (Nmap)",
+		"regex": re.compile(rb"User-Agent:.*Nmap", re.IGNORECASE),
+		"desc": "Nmap Scripting Engine detected"
+	},
+	{
+		"name": "Scanner Tool (Nikto)",
+		"regex": re.compile(rb"User-Agent:.*Nikto", re.IGNORECASE),
+		"desc": "Web Vulnerability Scanner detected"
+	},
+	{
+		"name": "Scanner Tool (Sqlmap)",
+		"regex": re.compile(rb"User-Agent:.*sqlmap", re.IGNORECASE),
+		"desc": "SQL Injection tool detected"
+	},
+	{
+		"name": "Python Script",
+		"regex": re.compile(rb"User-Agent:.*python-requests", re.IGNORECASE),
+		"desc": "Potential automated python script"
+	},
+	{
 		"name": "SQL Injection (Union)",
-		"pattern": b"UNION SELECT",
+		"regex": re.compile(rb"union\s+select", re.IGNORECASE),
 		"desc": "Attempt to retrieve hidden database data"
 	},
 	{
 		"name": "SQL Injection (Generic)",
-		"pattern": b"OR 1=1",
+		"regex": re.compile(rb"or\s+1=1", re.IGNORECASE),
 		"desc": "Attempt to bypass authentication logic"
 	},
 	{
 		"name": "XSS (Script Tag)",
-		"pattern": b"<script>",
-		"desc": "Cross-Site Scripting attempt to run code in browser"
+		"regex": re.compile(rb"<script.*?>.*?</script>", re.IGNORECASE | re.DOTALL),
+		"desc": "Cross-Site Scripting attempt"
 	},
 	{
 		"name": "Directory Traversal",
-		"pattern": b"../",
-		"desc": "Attempt to access files outside the web root"
+		"regex": re.compile(rb"\.\./", re.IGNORECASE),
+		"desc": "Attempt to access files outside web root"
 	},
 	{
 		"name": "Password File Access",
-		"pattern": b"/etc/passwd",
+		"regex": re.compile(rb"/etc/passwd", re.IGNORECASE),
 		"desc": "Attempt to read Linux user account list"
 	},
-
-	# malwalre shellcode section
 	{
 		"name": "Metasploit Shell",
-		"pattern": b"stdapi_sys_config_getuid",
+		"regex": re.compile(rb"stdapi_sys_config_getuid", re.IGNORECASE),
 		"desc": "Common Meterpreter payload string"
 	},
 	{
 		"name": "PHP Webshell",
-		"pattern": b"<?php system(",
+		"regex": re.compile(rb"<\?php\s+system\(", re.IGNORECASE),
 		"desc": "Attempt to execute system commands via PHP"
 	}
-#	{
-#		"name": "Nmap Scan (XMAS)",
-#		"pattern": b"\x00\x00\x00\x00\x00\x00",
-#		"desc": "Potential Reconnaissance Scan"
-#	}
 ]
 
 def check_signatures(payload):
-	payload_lower = payload.lower()
-
 	for sig in IDS_SIGNATURES:
-		pattern = sig["pattern"].lower()
-
-		if pattern in payload_lower:
-			return sig["name"], sig["desc"]
-
+		if "regex" in sig:
+			if sig["regex"].search(payload):
+				return sig["name"], sig["desc"]
 	return None, None
